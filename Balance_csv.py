@@ -382,14 +382,3 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"Failed to process dataset: {str(e)}")
         raise
-
-
-# Basic usage
-#python balance_data.py --input your_data.csv
-
-# Advanced usage with parallel processing
-#python balance_data.py \
-#    --input your_data.csv \
-#    --output-dir data \
-#    --max-workers 8 \
-#    --batch-size 20
