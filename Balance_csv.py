@@ -3,10 +3,10 @@ import numpy as np
 from pathlib import Path
 import faiss
 import pickle
-from typing import List, Dict, Tuple, Set, Optional, Iterator
+from typing import List, Dict, Tuple, Set, Optional, Callable, Any, Iterator
 from dataclasses import dataclass
 from sentence_transformers import SentenceTransformer
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import random
 from tqdm import tqdm
 from test import *  # for chinou_response
@@ -15,14 +15,13 @@ import logging
 import time
 from threading import Lock
 import os
-from itertools import islice
 import math
 
 # Constants
 SAMPLES_PER_CLASS = 500
-BATCH_SIZE = 5  # For LLM generation
-EMBEDDING_BATCH_SIZE = 32  # For embedding creation
-MAX_RETRIES = 3
+BATCH_SIZE = 5
+EMBEDDING_BATCH_SIZE = 32
+MAX_RETRIES = 5
 MAX_WORKERS = 4
 CONTEXT_SIZE = 6
 
@@ -33,9 +32,86 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+class AdaptiveRateLimiter:
+    """Adapts to API limits by monitoring responses."""
+    
+    def __init__(self):
+        self.lock = Lock()
+        self.error_window = []
+        self.window_size = 10
+        self.current_delay = 1.0
+        self.min_delay = 0.5
+        self.max_delay = 30.0
+        self.last_request_time = 0
+        self.success_count = 0
+        self.error_count = 0
+
+    def update_delay(self, success: bool):
+        with self.lock:
+            self.error_window.append(not success)
+            if len(self.error_window) > self.window_size:
+                self.error_window.pop(0)
+            
+            error_rate = sum(self.error_window) / len(self.error_window)
+            
+            if success:
+                self.success_count += 1
+                if self.success_count >= 5:
+                    self.current_delay = max(
+                        self.min_delay,
+                        self.current_delay * 0.9
+                    )
+                    self.success_count = 0
+            else:
+                self.error_count += 1
+                self.success_count = 0
+                self.current_delay = min(
+                    self.max_delay,
+                    self.current_delay * 2
+                )
+            
+            if error_rate > 0.1:  # More than 10% errors
+                logger.warning(f"High error rate detected: {error_rate:.2%}")
+
+    def wait(self):
+        with self.lock:
+            current_time = time.time()
+            time_since_last = current_time - self.last_request_time
+            wait_time = max(0, self.current_delay - time_since_last)
+            if wait_time > 0:
+                time.sleep(wait_time)
+            self.last_request_time = time.time()
+
+class AdaptiveRetryHandler:
+    """Handles retries with adaptive backoff."""
+    
+    def __init__(self, max_retries: int = MAX_RETRIES):
+        self.max_retries = max_retries
+        self.rate_limiter = AdaptiveRateLimiter()
+
+    def execute_with_retry(self, func: Callable[..., Any], *args, **kwargs) -> Any:
+        last_exception = None
+        
+        for attempt in range(self.max_retries):
+            try:
+                self.rate_limiter.wait()
+                result = func(*args, **kwargs)
+                self.rate_limiter.update_delay(success=True)
+                return result
+                
+            except Exception as e:
+                last_exception = e
+                self.rate_limiter.update_delay(success=False)
+                logger.warning(
+                    f"Attempt {attempt + 1}/{self.max_retries} failed: {str(e)}. "
+                    f"Current delay: {self.rate_limiter.current_delay:.2f}s"
+                )
+                
+        raise last_exception
+
 @dataclass
-class SynthesisTask:
-    """Structure for synthesis tasks."""
+class GenerationTask:
+    """Structure for generation tasks."""
     domain: str
     concept: str
     context_samples: List[Dict]
@@ -44,7 +120,8 @@ class SynthesisTask:
 class ParallelEmbeddingManager:
     """Manages parallel embedding creation and vector similarity search."""
     
-    def __init__(self, model_name: str = 'sentence-transformers/all-mpnet-base-v2',
+    def __init__(self, 
+                 model_name: str = 'sentence-transformers/all-mpnet-base-v2',
                  batch_size: int = EMBEDDING_BATCH_SIZE,
                  max_workers: int = MAX_WORKERS):
         self.embed_model = SentenceTransformer(model_name)
@@ -54,16 +131,13 @@ class ParallelEmbeddingManager:
         self.embeddings_dict = {}
 
     def batch_texts(self, texts: List[str]) -> Iterator[List[str]]:
-        """Split texts into batches."""
         for i in range(0, len(texts), self.batch_size):
             yield texts[i:i + self.batch_size]
 
     def process_batch(self, batch: List[str]) -> np.ndarray:
-        """Process a single batch of texts."""
         return self.embed_model.encode(batch, show_progress_bar=False)
 
     def create_embeddings_parallel(self, texts: List[str]) -> np.ndarray:
-        """Create embeddings in parallel batches."""
         batches = list(self.batch_texts(texts))
         embeddings_list = []
         
@@ -74,18 +148,11 @@ class ParallelEmbeddingManager:
             for future in tqdm(as_completed(futures),
                              total=len(futures),
                              desc="Creating embeddings"):
-                try:
-                    batch_embeddings = future.result()
-                    embeddings_list.append(batch_embeddings)
-                except Exception as e:
-                    logger.error(f"Error in embedding batch: {str(e)}")
-                    raise
+                embeddings_list.append(future.result())
 
-        # Combine all embeddings
         return np.vstack(embeddings_list) if embeddings_list else np.array([])
 
     def build_index(self, embeddings: np.ndarray) -> faiss.IndexFlatL2:
-        """Build FAISS index for embeddings."""
         dimension = embeddings.shape[1]
         index = faiss.IndexFlatL2(dimension)
         if len(embeddings) > 0:
@@ -95,33 +162,12 @@ class ParallelEmbeddingManager:
     def process_domain_concept(self, 
                              key: str,
                              samples: List[Dict]) -> Tuple[np.ndarray, faiss.IndexFlatL2]:
-        """Process embeddings and index for a domain-concept pair."""
         texts = [f"{s['attribute_name']} {s['description']}" for s in samples]
         embeddings = self.create_embeddings_parallel(texts)
         index = self.build_index(embeddings)
         return embeddings, index
 
-    def process_all_parallel(self, grouped_samples: Dict[str, List[Dict]]):
-        """Process all domain-concept pairs in parallel."""
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = {
-                executor.submit(self.process_domain_concept, key, samples): key
-                for key, samples in grouped_samples.items()
-            }
-            
-            for future in tqdm(as_completed(futures),
-                             total=len(futures),
-                             desc="Processing domain-concepts"):
-                key = futures[future]
-                try:
-                    embeddings, index = future.result()
-                    self.embeddings_dict[key] = embeddings
-                    self.index_dict[key] = index
-                except Exception as e:
-                    logger.error(f"Error processing {key}: {str(e)}")
-
     def save_state(self, save_path: str):
-        """Save embeddings and indexes."""
         save_path = Path(save_path)
         save_path.mkdir(parents=True, exist_ok=True)
         
@@ -131,111 +177,41 @@ class ParallelEmbeddingManager:
                 'embeddings_dict': self.embeddings_dict
             }, f)
 
-class ParallelSampleGenerator:
-    """Handles parallel synthetic sample generation with context management."""
+class SampleGenerator:
+    """Handles synthetic sample generation with context management."""
     
-    def __init__(self, batch_size: int = BATCH_SIZE, max_workers: int = MAX_WORKERS):
+    def __init__(self, batch_size: int = BATCH_SIZE):
         self.batch_size = batch_size
-        self.max_workers = max_workers
         self.used_samples_lock = Lock()
-    
-    def generate_samples_parallel(self,
-                                domain: str,
-                                concept: str,
-                                base_samples: List[Dict],
-                                num_needed: int,
-                                used_samples: Set[str]) -> List[Dict]:
-        """Generate samples in parallel batches."""
-        synthetic_samples = []
-        k = min(CONTEXT_SIZE, len(base_samples))
-        
-        num_batches = math.ceil(num_needed / self.batch_size)
-        remaining = num_needed
-        
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = []
-            
-            for _ in range(num_batches):
-                current_batch_size = min(self.batch_size, remaining)
-                if current_batch_size <= 0:
-                    break
-                
-                futures.append(
-                    executor.submit(
-                        self.generate_batch,
-                        domain,
-                        concept,
-                        base_samples,
-                        k,
-                        current_batch_size,
-                        used_samples
-                    )
-                )
-                remaining -= current_batch_size
-            
-            for future in tqdm(as_completed(futures),
-                             total=len(futures),
-                             desc=f"Generating samples for {domain}-{concept}"):
-                try:
-                    batch_samples = future.result()
-                    synthetic_samples.extend(batch_samples)
-                except Exception as e:
-                    logger.error(f"Batch generation error: {str(e)}")
-        
-        return synthetic_samples[:num_needed]
+        self.retry_handler = AdaptiveRetryHandler()
+        self.generation_stats = {
+            'attempts': 0,
+            'successes': 0,
+            'failures': 0
+        }
 
-    def generate_batch(self,
-                      domain: str,
-                      concept: str,
-                      base_samples: List[Dict],
-                      k: int,
-                      batch_size: int,
-                      used_samples: Set[str]) -> List[Dict]:
-        """Generate a single batch of samples."""
-        context = self.get_shuffled_context(base_samples, k)
-        prompt = self.generate_prompt(domain, concept, context, batch_size)
-        
-        for attempt in range(MAX_RETRIES):
-            try:
-                response = chinou_response(prompt)
-                samples = self.validate_batch_response(response, batch_size)
-                
-                if not samples:
-                    continue
-                
-                valid_samples = []
-                with self.used_samples_lock:
-                    for sample in samples:
-                        sample['domain'] = domain
-                        sample['concept'] = concept
-                        sample_key = f"{sample['attribute_name']}_{sample['description']}"
-                        
-                        if sample_key not in used_samples:
-                            used_samples.add(sample_key)
-                            valid_samples.append(sample)
-                
-                if len(valid_samples) == batch_size:
-                    return valid_samples
-                    
-            except Exception as e:
-                logger.error(f"Batch generation attempt {attempt + 1} failed: {str(e)}")
-                time.sleep(1)
-        
-        return []
+    def _determine_k(self, sample_size: int) -> int:
+        """Determine dynamic k based on sample size."""
+        if sample_size <= 1:
+            return 1
+        elif sample_size <= 3:
+            return min(sample_size, 2)
+        elif sample_size <= 10:
+            return min(sample_size, 3)
+        else:
+            return min(sample_size, 6)
 
-    @staticmethod
-    def get_shuffled_context(samples: List[Dict], k: int) -> List[Dict]:
+    def get_shuffled_context(self, samples: List[Dict], k: int) -> List[Dict]:
         """Get shuffled context samples."""
         available = samples.copy()
         random.shuffle(available)
         return available[:k]
 
-    @staticmethod
-    def generate_prompt(domain: str, 
-                       concept: str, 
+    def generate_prompt(self, 
+                       domain: str,
+                       concept: str,
                        context_samples: List[Dict],
                        batch_size: int) -> str:
-        """Generate prompt for LLM."""
         context_str = "\n".join([
             f"Example {i+1}:\nAttribute: {s['attribute_name']}\nDescription: {s['description']}"
             for i, s in enumerate(context_samples)
@@ -260,7 +236,6 @@ Output {batch_size} lines of JSON only, no additional text."""
 
     @staticmethod
     def validate_batch_response(response: str, expected_count: int) -> List[Dict]:
-        """Validate LLM response."""
         valid_samples = []
         lines = [line.strip() for line in response.split('\n') if line.strip()]
         
@@ -274,119 +249,144 @@ Output {batch_size} lines of JSON only, no additional text."""
         
         return valid_samples if len(valid_samples) == expected_count else []
 
-class ParallelDataBalancer:
-    """Main class for parallel data balancing operations."""
+    def generate_batch(self,
+                      domain: str,
+                      concept: str,
+                      base_samples: List[Dict],
+                      k: int,
+                      used_samples: Set[str]) -> List[Dict]:
+        """Generate batch with retry and rate limiting."""
+        context = self.get_shuffled_context(base_samples, k)
+        prompt = self.generate_prompt(domain, concept, context, self.batch_size)
+        
+        def _make_llm_call():
+            self.generation_stats['attempts'] += 1
+            return chinou_response(prompt)
+        
+        try:
+            response = self.retry_handler.execute_with_retry(_make_llm_call)
+            samples = self.validate_batch_response(response, self.batch_size)
+            
+            if not samples:
+                self.generation_stats['failures'] += 1
+                return []
+            
+            valid_samples = []
+            with self.used_samples_lock:
+                for sample in samples:
+                    sample['domain'] = domain
+                    sample['concept'] = concept
+                    sample_key = f"{sample['attribute_name']}_{sample['description']}"
+                    
+                    if sample_key not in used_samples:
+                        used_samples.add(sample_key)
+                        valid_samples.append(sample)
+            
+            if valid_samples:
+                self.generation_stats['successes'] += 1
+                
+            return valid_samples
+                
+        except Exception as e:
+            self.generation_stats['failures'] += 1
+            logger.error(f"Batch generation failed after all retries: {str(e)}")
+            return []
+
+    def generate_samples(self,
+                        domain: str,
+                        concept: str,
+                        base_samples: List[Dict],
+                        num_needed: int,
+                        used_samples: Set[str]) -> List[Dict]:
+        """Generate all needed samples for a domain-concept pair."""
+        synthetic_samples = []
+        k = self._determine_k(len(base_samples))
+        
+        while len(synthetic_samples) < num_needed:
+            batch = self.generate_batch(
+                domain,
+                concept,
+                base_samples,
+                k,
+                used_samples
+            )
+            
+            if batch:
+                synthetic_samples.extend(batch)
+            else:
+                logger.warning(f"Failed to generate batch for {domain}-{concept}")
+                time.sleep(2)  # Additional cooldown on failure
+        
+        return synthetic_samples[:num_needed]
+
+    def log_generation_stats(self):
+        stats = self.generation_stats
+        success_rate = (stats['successes'] / stats['attempts']) if stats['attempts'] > 0 else 0
+        
+        logger.info("\nGeneration Statistics:")
+        logger.info(f"Total attempts: {stats['attempts']}")
+        logger.info(f"Successful generations: {stats['successes']}")
+        logger.info(f"Failed generations: {stats['failures']}")
+        logger.info(f"Success rate: {success_rate:.2%}")
+        logger.info(f"Current delay: {self.retry_handler.rate_limiter.current_delay:.2f}s")
+
+class DataBalancer:
+    """Main class for data balancing operations."""
     
     def __init__(self,
                  max_workers: int = MAX_WORKERS,
                  batch_size: int = BATCH_SIZE):
         self.max_workers = max_workers
+        self.sample_generator = SampleGenerator(batch_size)
         self.embedding_manager = ParallelEmbeddingManager(max_workers=max_workers)
-        self.sample_generator = ParallelSampleGenerator(
-            batch_size=batch_size,
-            max_workers=max_workers
-        )
-
-    def prepare_tasks(self, df: pd.DataFrame) -> Dict[str, Tuple[str, str, List[Dict], int]]:
-        """Prepare tasks for parallel processing."""
-        tasks = {}
-        
-        for (domain, concept), group in df.groupby(['domain', 'concept']):
-            samples = group.to_dict('records')
-            key = f"{domain}_{concept}"
-            
-            if len(samples) < SAMPLES_PER_CLASS:
-                tasks[key] = (
-                    domain,
-                    concept,
-                    samples,
-                    SAMPLES_PER_CLASS - len(samples)
-                )
-        
-        return tasks
-
-    def process_task(self,
-                    domain: str,
-                    concept: str,
-                    samples: List[Dict],
-                    num_needed: int,
-                    used_samples: Set[str]) -> List[Dict]:
-        """Process a single task."""
-        return self.sample_generator.generate_samples_parallel(
-            domain,
-            concept,
-            samples,
-            num_needed,
-            used_samples
-        )
 
     def balance_dataset(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """Balance dataset with parallel processing."""
-        logger.info("Starting parallel dataset balancing...")
+        logger.info("Starting dataset balancing...")
         
         # Initialize storage
         training_samples = []
         eval_samples = []
         used_samples = set()
         
-        # Group samples by domain-concept
-        grouped_samples = {}
+        # Process each domain-concept pair
         for (domain, concept), group in df.groupby(['domain', 'concept']):
             samples = group.to_dict('records')
-            key = f"{domain}_{concept}"
+            logger.info(f"\nProcessing {domain}-{concept}: {len(samples)} samples")
             
             if len(samples) > SAMPLES_PER_CLASS:
                 # Move excess to evaluation
                 random.shuffle(samples)
                 training_samples.extend(samples[:SAMPLES_PER_CLASS])
                 eval_samples.extend(samples[SAMPLES_PER_CLASS:])
+                logger.info(f"Split into {SAMPLES_PER_CLASS} training and {len(samples)-SAMPLES_PER_CLASS} evaluation samples")
             else:
+                # Add all to training and generate synthetic
                 training_samples.extend(samples)
-                grouped_samples[key] = samples
-            
-            # Track used samples
-            for sample in samples:
-                used_samples.add(f"{sample['attribute_name']}_{sample['description']}")
-        
-        # Process embeddings in parallel
-        logger.info("Processing embeddings...")
-        self.embedding_manager.process_all_parallel(grouped_samples)
-        
-        # Prepare synthesis tasks
-        tasks = self.prepare_tasks(df)
-        
-        # Generate synthetic samples in parallel
-        if tasks:
-            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                futures = {
-                    executor.submit(
-                        self.process_task,
+                num_needed = SAMPLES_PER_CLASS - len(samples)
+                
+                if num_needed > 0:
+                    logger.info(f"Generating {num_needed} synthetic samples...")
+                    synthetic = self.sample_generator.generate_samples(
                         domain,
                         concept,
                         samples,
                         num_needed,
                         used_samples
-                    ): key
-                    for key, (domain, concept, samples, num_needed) in tasks.items()
-                }
-                
-                for future in tqdm(as_completed(futures),
-                                 total=len(futures),
-                                 desc="Generating synthetic samples"):
-                    key = futures[future]
-                    try:
-                        synthetic_samples = future.result()
-                        training_samples.extend(synthetic_samples)
-                        logger.info(f"Generated {len(synthetic_samples)} samples for {key}")
-                    except Exception as e:
-                        logger.error(f"Failed to generate samples for {key}: {str(e)}")
+                    )
+                    training_samples.extend(synthetic)
+                    logger.info(f"Generated {len(synthetic)} synthetic samples")
+            
+            # Track used samples
+            for sample in samples:
+                used_samples.add(f"{sample['attribute_name']}_{sample['description']}")
         
         # Create final dataframes
         training_df = pd.DataFrame(training_samples)
         eval_df = pd.DataFrame(eval_samples)
         
-        # Save embeddings state
-        self.embedding_manager.save_state('data/embeddings')
+        # Log generation statistics
+        self.sample_generator.log_generation_stats()
         
         return training_df, eval_df
 
@@ -400,12 +400,31 @@ def main(input_path: str,
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
         
+        # Set up logging file
+        log_path = output_path / 'balancer.log'
+        file_handler = logging.FileHandler(log_path)
+        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        logger.addHandler(file_handler)
+        
         # Read input data
         logger.info(f"Reading data from {input_path}")
         df = pd.read_csv(input_path)
         
+        # Validate input data
+        required_columns = {'attribute_name', 'description', 'domain', 'concept'}
+        if not required_columns.issubset(df.columns):
+            raise ValueError(f"Input CSV must contain columns: {required_columns}")
+        
+        # Log initial statistics
+        logger.info("\nInitial Data Statistics:")
+        logger.info(f"Total records: {len(df)}")
+        logger.info(f"Unique domains: {df['domain'].nunique()}")
+        logger.info(f"Unique concepts: {df['concept'].nunique()}")
+        logger.info("\nDomain-Concept Distribution:")
+        logger.info(df.groupby(['domain', 'concept']).size())
+        
         # Initialize balancer
-        balancer = ParallelDataBalancer(max_workers, batch_size)
+        balancer = DataBalancer(max_workers, batch_size)
         
         # Process data
         start_time = time.time()
@@ -435,29 +454,22 @@ def main(input_path: str,
             f"Concepts: {df['concept'].nunique()}",
             "\nOriginal Distribution:",
             str(df.groupby(['domain', 'concept']).size()),
-            "\nTraining Set Distribution:",
+            "\nBalanced Training Set Distribution:",
             str(training_df.groupby(['domain', 'concept']).size()),
             "\nEvaluation Set Distribution:",
             str(eval_df.groupby(['domain', 'concept']).size()),
             f"\nProcessing Performance:",
             f"Average time per sample: {processing_time/len(training_df):.3f} seconds",
             f"Samples per second: {len(training_df)/processing_time:.2f}",
-            f"\nParallelization Stats:",
-            f"Worker processes: {max_workers}",
-            f"Batch size (LLM): {batch_size}",
-            f"Batch size (Embeddings): {EMBEDDING_BATCH_SIZE}"
-        ]
-        
-        # Add synthetic samples stats
-        synthetic_count = len(training_df) - (len(df) - len(eval_df))
-        report.extend([
             f"\nSynthetic Sample Statistics:",
             f"Original samples: {len(df)}",
             f"Training samples: {len(training_df)}",
             f"Evaluation samples: {len(eval_df)}",
-            f"Generated samples: {synthetic_count}",
-            f"Generation ratio: {synthetic_count/len(df):.2f}x"
-        ])
+            f"Generated samples: {len(training_df) - (len(df) - len(eval_df))}",
+            f"\nRate Limiting Statistics:",
+            f"Average delay between requests: {balancer.sample_generator.retry_handler.rate_limiter.current_delay:.2f}s",
+            f"Final error rate: {sum(balancer.sample_generator.retry_handler.rate_limiter.error_window)/len(balancer.sample_generator.retry_handler.rate_limiter.error_window) if balancer.sample_generator.retry_handler.rate_limiter.error_window else 0:.2%}"
+        ]
         
         # Save report
         report_path = output_path / 'balance_report.txt'
@@ -466,10 +478,11 @@ def main(input_path: str,
         
         logger.info(f"\nProcessing complete!")
         logger.info(f"Files saved:")
-        logger.info(f"1. Training data: {training_path}")
-        logger.info(f"2. Evaluation data: {eval_path}")
-        logger.info(f"3. Balance report: {report_path}")
-        logger.info(f"4. Embeddings state: {output_path}/embeddings/embedding_state.pkl")
+        logger.info(f"1. Original data: {original_path}")
+        logger.info(f"2. Training data: {training_path}")
+        logger.info(f"3. Evaluation data: {eval_path}")
+        logger.info(f"4. Balance report: {report_path}")
+        logger.info(f"5. Process log: {log_path}")
         
         return str(training_path), str(eval_path)
         
@@ -480,9 +493,7 @@ def main(input_path: str,
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(
-        description='Balance dataset with parallel processing and optimized embedding generation'
-    )
+    parser = argparse.ArgumentParser(description='Balance dataset with adaptive rate limiting')
     parser.add_argument('--input', 
                        required=True,
                        help='Input CSV file path')
@@ -496,11 +507,7 @@ if __name__ == "__main__":
     parser.add_argument('--batch-size',
                        type=int,
                        default=BATCH_SIZE,
-                       help='Batch size for LLM generation')
-    parser.add_argument('--embedding-batch-size',
-                       type=int,
-                       default=EMBEDDING_BATCH_SIZE,
-                       help='Batch size for embedding generation')
+                       help='Batch size for generation')
     
     args = parser.parse_args()
     
