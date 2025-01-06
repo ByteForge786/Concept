@@ -1,4 +1,198 @@
 import pandas as pd
+from imblearn.over_sampling import SMOTE
+from sentence_transformers import SentenceTransformer
+import numpy as np
+from collections import defaultdict
+
+# More comprehensive example data with edge cases
+original_data = {
+    'attribute_name': [
+        # Financial metrics (many samples)
+        'monthly_revenue', 'daily_revenue', 'quarterly_revenue', 'annual_revenue', 'subscription_revenue',
+        # User Analytics (medium samples)
+        'dau', 'mau', 'wau',
+        # Performance (few samples)
+        'latency',
+        # Security (single sample)
+        'failed_logins'
+    ],
+    'description': [
+        # Financial descriptions
+        'Monthly revenue from all product sales',
+        'Daily revenue from subscriptions',
+        'Quarterly revenue including all sources',
+        'Annual revenue for fiscal year',
+        'Monthly recurring revenue from subscriptions',
+        # User Analytics descriptions
+        'Daily active users in the platform',
+        'Monthly active users count',
+        'Weekly active users in system',
+        # Performance description
+        'Average response time in milliseconds',
+        # Security description
+        'Number of failed login attempts'
+    ],
+    'domain': [
+        # Domains
+        'Financial', 'Financial', 'Financial', 'Financial', 'Financial',
+        'User Analytics', 'User Analytics', 'User Analytics',
+        'Performance', 
+        'Security'
+    ],
+    'concept': [
+        # Concepts
+        'Revenue', 'Revenue', 'Revenue', 'Revenue', 'Revenue',
+        'Usage', 'Usage', 'Usage',
+        'Latency',
+        'Access'
+    ]
+}
+
+def dynamic_smote_balance(df: pd.DataFrame, target_samples: int = None):
+    """
+    Balance dataset using SMOTE with dynamic neighbors per class.
+    
+    Args:
+        df: Input DataFrame
+        target_samples: Target number of samples per class (default: size of largest class)
+    """
+    print("\nOriginal Data Distribution:")
+    print("=" * 50)
+    class_counts = df.groupby(['domain', 'concept']).size()
+    print(class_counts)
+    
+    # If target_samples not specified, use size of largest class
+    if target_samples is None:
+        target_samples = class_counts.max()
+    
+    # Convert text to embeddings
+    encoder = SentenceTransformer('sentence-transformers/all-mpnet-base-v2')
+    embeddings = encoder.encode(df['description'].tolist())
+    
+    # Create combined target
+    df['target'] = df['domain'] + '_' + df['concept']
+    target_counts = df['target'].value_counts()
+    
+    # Process each class separately with dynamic k_neighbors
+    balanced_samples = []
+    
+    for target in target_counts.index:
+        domain, concept = target.split('_')
+        class_mask = (df['target'] == target)
+        class_embeddings = embeddings[class_mask]
+        class_df = df[class_mask]
+        
+        n_samples = len(class_df)
+        
+        print(f"\nProcessing {domain} - {concept}")
+        print(f"Original samples: {n_samples}")
+        
+        if n_samples == 1:
+            print("Single sample case - Using data augmentation")
+            # For single sample, create variations
+            original_desc = class_df['description'].iloc[0]
+            for i in range(target_samples - 1):
+                # Create variations by adding qualifiers
+                variations = [
+                    f"Alternative {i+1}: {original_desc}",
+                    f"Variant {i+1} of: {original_desc}",
+                    f"Similar to: {original_desc}"
+                ]
+                synthetic_desc = np.random.choice(variations)
+                balanced_samples.append({
+                    'attribute_name': f'synthetic_{domain}_{concept}_{i}',
+                    'description': synthetic_desc,
+                    'domain': domain,
+                    'concept': concept,
+                    'target': target
+                })
+        elif n_samples < target_samples:
+            print(f"Applying SMOTE with k_neighbors={n_samples-1}")
+            # Use all available samples as neighbors
+            smote = SMOTE(
+                random_state=42,
+                k_neighbors=n_samples-1,
+                n_jobs=-1
+            )
+            
+            # Calculate how many synthetic samples needed
+            n_synthetic = target_samples - n_samples
+            
+            try:
+                X_resampled, y_resampled = smote.fit_resample(
+                    class_embeddings,
+                    [1] * len(class_embeddings)
+                )
+                
+                # Generate synthetic descriptions
+                for i in range(n_samples, len(X_resampled)):
+                    # Find closest original description
+                    similarities = class_embeddings @ X_resampled[i].T
+                    closest_idx = np.argmax(similarities)
+                    original_desc = class_df['description'].iloc[closest_idx]
+                    
+                    synthetic_desc = f"SMOTE Generated ({i-n_samples+1}): Based on {original_desc}"
+                    
+                    balanced_samples.append({
+                        'attribute_name': f'synthetic_{domain}_{concept}_{i}',
+                        'description': synthetic_desc,
+                        'domain': domain,
+                        'concept': concept,
+                        'target': target
+                    })
+            except ValueError as e:
+                print(f"SMOTE failed: {e}. Using simple replication.")
+                # Fallback to simple replication
+                for i in range(n_synthetic):
+                    original_idx = i % n_samples
+                    original_desc = class_df['description'].iloc[original_idx]
+                    synthetic_desc = f"Replicated ({i+1}): {original_desc}"
+                    
+                    balanced_samples.append({
+                        'attribute_name': f'synthetic_{domain}_{concept}_{i}',
+                        'description': synthetic_desc,
+                        'domain': domain,
+                        'concept': concept,
+                        'target': target
+                    })
+        
+        # Keep original samples
+        balanced_samples.extend(class_df.to_dict('records'))
+    
+    # Create final balanced DataFrame
+    balanced_df = pd.DataFrame(balanced_samples)
+    
+    print("\nFinal Balanced Distribution:")
+    print("=" * 50)
+    print(balanced_df.groupby(['domain', 'concept']).size())
+    
+    # Show examples of synthetic samples
+    print("\nSynthetic Sample Examples:")
+    print("-" * 50)
+    synthetic_samples = balanced_df[balanced_df['attribute_name'].str.startswith('synthetic_')]
+    for domain in synthetic_samples['domain'].unique():
+        domain_samples = synthetic_samples[synthetic_samples['domain'] == domain]
+        print(f"\n{domain}:")
+        for _, row in domain_samples.head(2).iterrows():
+            print(f"{row['concept']}: {row['description']}")
+    
+    return balanced_df
+
+# Run example
+if __name__ == "__main__":
+    df = pd.DataFrame(original_data)
+    balanced_df = dynamic_smote_balance(df)
+
+
+
+
+
+
+
+
+
+
+import pandas as pd
 import numpy as np
 from pathlib import Path
 import random
