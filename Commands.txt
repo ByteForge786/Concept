@@ -1,0 +1,180 @@
+# End-to-End Command Guide for Hierarchical Classifier
+
+## Scenario 1: First Time Training with Labeled Data
+```bash
+# Your input CSV should have format:
+# attribute_name,description,domain,concept
+# user_count,Number of active users,User Analytics,Usage Metrics
+# ...
+
+# Step 1: Train the model
+python classifier.py --mode train \
+    --input_file your_labeled_data.csv \
+    --classification_head logistic \
+    --description_refine
+
+# The model will be saved in experiments/logistic/<timestamp>/
+# The path will be printed after training
+
+# Step 2: Evaluate the model
+python classifier.py --mode evaluate \
+    --input_file your_labeled_data.csv \
+    --model_path experiments/logistic/<timestamp>
+
+# Step 3: Make predictions on new data
+python classifier.py --mode predict \
+    --input_file new_data.csv \
+    --model_path experiments/logistic/<timestamp>
+```
+
+## Scenario 2: You Have New Unlabeled Data (Production Use)
+```bash
+# Your input CSV needs only:
+# attribute_name,description
+# new_metric,Description of the metric
+# ...
+
+# Option 1: Use specific model
+python classifier.py --mode predict \
+    --input_file your_unlabeled_data.csv \
+    --model_path experiments/logistic/<known_timestamp>
+
+# Option 2: Let system pick best model
+python classifier.py --mode predict \
+    --input_file your_unlabeled_data.csv
+# It will show available models and let you choose
+```
+
+## Scenario 3: You Have New Labeled Data (Want to Train New Model)
+```bash
+# First backup your old experiment history
+cp experiments/experiment_history.json experiments/experiment_history_backup.json
+
+# Train new model with new data
+python classifier.py --mode train \
+    --input_file your_new_labeled_data.csv \
+    --classification_head logistic \
+    --description_refine
+
+# Evaluate new model
+python classifier.py --mode evaluate \
+    --input_file your_test_data.csv \
+    --model_path experiments/logistic/<new_timestamp>
+```
+
+## Scenario 4: Single Text Prediction
+```bash
+# Option 1: With attribute name
+python classifier.py --mode predict \
+    --input_file "Daily Users:Count of users per day" \
+    --model_path experiments/logistic/latest
+
+# Option 2: Without attribute name
+python classifier.py --mode predict \
+    --input_file "Count of users per day" \
+    --model_path experiments/logistic/latest
+```
+
+## Common File Formats
+
+### 1. Labeled Data Format (for training/evaluation)
+```csv
+attribute_name,description,domain,concept
+user_count,Daily active users count,User Analytics,Usage Metrics
+revenue,Total daily revenue,Finance,Revenue Metrics
+```
+
+### 2. Unlabeled Data Format (for prediction)
+```csv
+attribute_name,description
+new_metric,Description of new metric
+another_metric,Another description
+```
+
+## Quick Commands for Different Situations
+
+### New Installation
+```bash
+# Create directories
+mkdir -p experiments logs predictions
+
+# Install requirements
+pip install pandas numpy torch sentence-transformers scikit-learn xgboost joblib pyyaml tqdm
+```
+
+### Best Model Selection
+```bash
+# Will automatically show and let you select best model
+python classifier.py --mode predict \
+    --input_file your_data.csv
+```
+
+### Using Latest Model
+```bash
+# Uses most recent model automatically
+python classifier.py --mode predict \
+    --input_file your_data.csv \
+    --model_path experiments/logistic/latest
+```
+
+## Tips & Tricks
+
+1. **Model Paths**:
+   - Latest model: use `experiments/logistic/latest`
+   - Specific model: use `experiments/logistic/<timestamp>`
+   - Best model: don't specify model_path, system will help you choose
+
+2. **Description Refinement**:
+   - Add `--description_refine` to standardize descriptions
+   - Useful for inconsistent descriptions
+   - Takes longer but might improve accuracy
+
+3. **Batch Processing**:
+   - Increase batch size for faster processing:
+   ```bash
+   --batch_size 64
+   ```
+   - Adjust workers for parallel processing:
+   ```bash
+   --num_workers 8
+   ```
+
+4. **Output Files**:
+   - Trained models: `experiments/<classifier_type>/<timestamp>/`
+   - Predictions: `predictions/predictions_<timestamp>.csv`
+   - Logs: `logs/training.log`
+   - Model history: `experiments/experiment_history.json`
+
+5. **Error Handling**:
+   - Check logs in `logs/training.log` for errors
+   - Backup experiment_history.json before major changes
+   - Verify input CSV format matches requirements
+
+## Examples for Complete Workflow
+
+### Initial Training and Deployment
+```bash
+# 1. Train initial model
+python classifier.py --mode train \
+    --input_file training_data.csv \
+    --classification_head logistic \
+    --description_refine
+
+# 2. Evaluate performance
+python classifier.py --mode evaluate \
+    --input_file test_data.csv \
+    --model_path experiments/logistic/latest
+
+# 3. Use for predictions
+python classifier.py --mode predict \
+    --input_file new_data.csv \
+    --model_path experiments/logistic/latest
+```
+
+### Regular Production Use
+```bash
+# Just use predict mode with latest model
+python classifier.py --mode predict \
+    --input_file production_data.csv \
+    --model_path experiments/logistic/latest
+```
