@@ -1,97 +1,129 @@
-class ImprovedSampleGenerator:
-    """Enhanced sample generator with better parallelization"""
+class SampleGenerator:
+    """Handles synthetic sample generation with parallel processing."""
     
-    def generate_batch(self,
-                      domain: str,
-                      concept: str,
-                      context_samples: List[Dict],
-                      definition: str = "") -> List[Dict]:
-        """Generate a single batch of samples (non-async version)"""
-        prompt = self.generate_prompt(domain, concept, context_samples, self.batch_size, definition)
+    def __init__(self, batch_size: int = BATCH_SIZE, definitions_path: str = 'definitions.txt'):
+        self.batch_size = batch_size
+        self.used_samples_lock = Lock()
+        self.retry_handler = AdaptiveRetryHandler()
+        self.generation_stats = {
+            'attempts': 0,
+            'successes': 0,
+            'failures': 0
+        }
+        self.definitions = self._load_definitions(definitions_path)
         
+    def _load_definitions(self, definitions_path: str) -> Dict[Tuple[str, str], str]:
+        """Load domain-concept definitions from file."""
+        definitions = {}
         try:
-            self.rate_limiter.wait()
-            response = chinou_response(prompt)  # Your LLM call
-            self.rate_limiter.update_delay(True)
-            
-            samples = self.validate_batch(response, domain, concept)
-            stats = self.stats[(domain, concept)]
-            
-            if samples:
-                stats.successful_generations += 1
-                stats.generated_samples += len(samples)
-            else:
-                stats.failed_generations += 1
-            
-            return samples
-            
+            with open(definitions_path, 'r') as f:
+                for line in f:
+                    if line.strip():
+                        domain, concept, definition = line.strip().split('|')
+                        definitions[(domain.strip(), concept.strip())] = definition.strip()
+            return definitions
         except Exception as e:
-            logger.error(f"Batch generation error: {str(e)}")
-            self.rate_limiter.update_delay(False)
-            self.stats[(domain, concept)].failed_generations += 1
-            return []
+            logger.warning(f"Failed to load definitions: {str(e)}")
+            return {}
 
-    def generate_samples(self,
-                        domain: str,
-                        concept: str,
-                        base_samples: List[Dict],
-                        num_needed: int,
-                        definition: str = "") -> List[Dict]:
-        """Generate samples with parallel processing"""
+    def generate_prompt(self, 
+                       domain: str,
+                       concept: str,
+                       context_samples: List[Dict],
+                       batch_size: int) -> str:
+        context_str = "\n".join([
+            f"Example {i+1}:\nAttribute: {s['attribute_name']}\nDescription: {s['description']}"
+            for i, s in enumerate(context_samples)
+        ])
         
-        # Initialize stats
-        stats = self.stats[(domain, concept)]
-        stats.original_samples = len(base_samples)
-        stats.needed_samples = num_needed
-        stats.start_time = time.time()
+        # Get definition for this domain-concept pair
+        definition = self.definitions.get((domain, concept), "")
+        definition_str = f"\nDefinition of {domain} - {concept}:\n{definition}\n" if definition else ""
         
-        logger.info(f"\nStarting generation for {domain}-{concept}")
-        logger.info(f"Original samples: {len(base_samples)}")
-        logger.info(f"Samples needed: {num_needed}")
+        return f"""Based on these examples from {domain} - {concept}:{definition_str}
+{context_str}
+
+Generate {batch_size} new, unique analytics attributes.
+Each must follow the pattern shown in examples but be distinctly different.
+
+Requirements:
+1. Attribute names must be in snake_case
+2. Descriptions should be clear and concise
+3. Must be different from examples
+4. Follow the exact pattern seen in examples
+5. Attributes should align with the provided domain-concept definition
+
+Provide exactly {batch_size} responses in this format, one per line:
+{{"attribute_name": "name", "description": "description"}}
+
+Output {batch_size} lines of JSON only, no additional text."""
+
+
+
+
+
+class DataBalancer:
+    """Main class for data balancing operations."""
+    
+    def __init__(self,
+                 max_workers: int = MAX_WORKERS,
+                 batch_size: int = BATCH_SIZE,
+                 definitions_path: str = 'definitions.txt'):
+        self.max_workers = max_workers
+        self.sample_generator = SampleGenerator(batch_size, definitions_path)
+        self.embedding_manager = ParallelEmbeddingManager(max_workers=max_workers)
+
+
+
+
+
+def main(input_path: str,
+         output_dir: str = 'data',
+         max_workers: int = MAX_WORKERS,
+         batch_size: int = BATCH_SIZE,
+         definitions_path: str = 'definitions.txt'):
+    """Main execution function."""
+    try:
+        # ... (previous code remains the same until balancer initialization)
         
-        synthetic_samples = []
-        context_size = min(5, len(base_samples))
+        # Initialize balancer with definitions path
+        balancer = DataBalancer(max_workers, batch_size, definitions_path)
         
-        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS) as executor:
-            futures = []
-            
-            while len(synthetic_samples) < num_needed:
-                # Calculate remaining samples
-                remaining = num_needed - len(synthetic_samples)
-                num_batches = math.ceil(remaining / self.batch_size)
-                
-                # Submit batch requests
-                for _ in range(num_batches):
-                    context = random.sample(base_samples, context_size)
-                    future = executor.submit(
-                        self.generate_batch,
-                        domain,
-                        concept,
-                        context,
-                        definition
-                    )
-                    futures.append(future)
-                
-                # Process completed futures
-                for future in as_completed(futures):
-                    batch = future.result()
-                    if batch:
-                        synthetic_samples.extend(batch)
-                        
-                    # Log progress
-                    if len(synthetic_samples) % 50 == 0:
-                        stats.log_progress(domain, concept)
-                    
-                    if len(synthetic_samples) >= num_needed:
-                        # Cancel remaining futures
-                        for f in futures:
-                            if not f.done():
-                                f.cancel()
-                        break
-                
-                # Clean up futures
-                futures = [f for f in futures if not f.done()]
-        
-        # Final progress log
-        stats.log_progress(domain, concept)
-        return synthetic_samples[:num_needed]
+        # ... (rest of the code remains the same)
+
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Balance dataset with adaptive rate limiting')
+    parser.add_argument('--input', 
+                       required=True,
+                       help='Input CSV file path')
+    parser.add_argument('--output-dir',
+                       default='data',
+                       help='Output directory')
+    parser.add_argument('--max-workers',
+                       type=int,
+                       default=MAX_WORKERS,
+                       help='Maximum number of parallel workers')
+    parser.add_argument('--batch-size',
+                       type=int,
+                       default=BATCH_SIZE,
+                       help='Batch size for generation')
+    parser.add_argument('--definitions',
+                       default='definitions.txt',
+                       help='Path to domain-concept definitions file')
+    
+    args = parser.parse_args()
+    
+    try:
+        main(
+            args.input,
+            args.output_dir,
+            args.max_workers,
+            args.batch_size,
+            args.definitions
+        )
+        logger.info("Processing completed successfully!")
+    except Exception as e:
+        logger.error(f"Failed to process dataset: {str(e)}")
+        raise
