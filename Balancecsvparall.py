@@ -178,6 +178,16 @@ class ParallelEmbeddingManager:
         index = self.build_index(embeddings)
         return embeddings, index
 
+    def save_state(self, save_path: str):
+        save_path = Path(save_path)
+        save_path.mkdir(parents=True, exist_ok=True)
+        
+        with open(save_path / 'embedding_state.pkl', 'wb') as f:
+            pickle.dump({
+                'index_dict': self.index_dict,
+                'embeddings_dict': self.embeddings_dict
+            }, f)
+
 class SampleGenerator:
     """Handles synthetic sample generation with parallel processing."""
     
@@ -398,9 +408,9 @@ class DataBalancer:
                     )
                     training_samples.extend(synthetic)
                     logger.info(f"Generated {len(synthetic)} synthetic samples")
-
-
-for sample in samples:
+            
+            # Track used samples
+            for sample in samples:
                 used_samples.add(f"{sample['attribute_name']}_{sample['description']}")
         
         # Create final dataframes
@@ -469,6 +479,7 @@ def main(input_path: str,
             f"\nProcessing Configuration:",
             f"Max Workers: {max_workers}",
             f"Batch Size: {batch_size}",
+            f"Max Concurrent Requests: {MAX_CONCURRENT_REQUESTS}",
             f"Processing Time: {processing_time:.2f} seconds",
             f"\nOriginal Data Statistics:",
             f"Total Records: {len(df)}",
@@ -545,4 +556,3 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"Failed to process dataset: {str(e)}")
         raise
-
