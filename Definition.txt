@@ -1,5 +1,12 @@
 # Format: domain|concept|definition
-user|engagement|Metrics that measure how users interact with and stay involved with the product over time
-user|satisfaction|Indicators that reflect how well the product meets user needs and expectations
-product|performance|Metrics that track how well the product functions in terms of speed, reliability, and efficiency
-product|usage|Measurements of how frequently and extensively different product features are utilized
+analytics|capital_balance|Business transaction capital and numerical point-in-time account balance tracking
+analytics|liquidity|Firm's ability to convert assets to cash, evaluated through stress testing of current accounts and marketable investments
+analytics|revenue|Income from business operations, with net revenue calculated as revenue minus operating costs
+analytics|cashflow|Expected future payments and receipts related to financial transaction obligations
+analytics|collateral|Pledged assets for transaction security according to agreements with counterparties
+analytics|accruals|Accumulated earned but unpaid interest or income tracking process
+analytics|pnl|Value change measurement of financial assets and liabilities between current and prior business day
+analytics|credit_risk|Analysis of counterparty default exposure in financial transactions, assessed through stress testing
+analytics|market_risk|Analysis of exposure to market factor changes affecting financial assets and liabilities values
+analytics|risk_metrics|Point-in-time quantification of financial holdings' sensitivity to market factor changes using mathematical models
+analytics|valuation|Present value calculation of financial holdings using mathematical models against current market data
