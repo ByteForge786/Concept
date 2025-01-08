@@ -2,75 +2,54 @@ import pandas as pd
 import sys
 from collections import defaultdict
 
-def clean_and_analyze_csv(input_file, output_file=None):
+def analyze_domain_concepts(input_file):
     """
-    Clean CSV by removing duplicates while keeping the first instance
-    and provide detailed statistics.
+    Analyze and print the number of records per concept within each domain.
 
     Args:
         input_file (str): Path to input CSV file
-        output_file (str, optional): Path to save cleaned CSV. 
-                                     If None, will use input filename with '_cleaned' suffix
     """
     try:
         # Read CSV
         df = pd.read_csv(input_file, encoding='utf-8')
 
         # Validate required columns
-        required_columns = {'attribute_name', 'domain', 'concept'}
+        required_columns = {'domain', 'concept'}
         missing_columns = required_columns - set(df.columns)
         if missing_columns:
             raise ValueError(f"Missing required columns: {missing_columns}")
 
-        # Print initial statistics
-        print("\n--- Initial Dataset Statistics ---")
-        print(f"Total records: {len(df)}")
-        
-        # Count initial records per domain
-        initial_domain_counts = df['domain'].value_counts()
-        print("\nInitial Records per Domain:")
-        for domain, count in initial_domain_counts.items():
-            print(f"{domain}: {count} records")
+        # Print total records
+        print(f"\nTotal Records: {len(df)}")
 
-        # Identify duplicates
-        duplicate_mask = df.duplicated(subset=['attribute_name', 'domain', 'concept'], keep='first')
-        total_duplicate_records = duplicate_mask.sum()
-        
-        print(f"\nTotal duplicate records: {total_duplicate_records}")
+        # Group by domain and count records per concept
+        domain_concept_counts = df.groupby(['domain', 'concept']).size().reset_index(name='record_count')
 
-        # Create cleaned DataFrame by dropping duplicates
-        # keep='first' ensures the first occurrence of a duplicate set is kept
-        cleaned_df = df.drop_duplicates(subset=['attribute_name', 'domain', 'concept'], keep='first')
+        # Organize results by domain
+        domain_summary = defaultdict(list)
+        for _, row in domain_concept_counts.iterrows():
+            domain_summary[row['domain']].append({
+                'concept': row['concept'],
+                'count': row['record_count']
+            })
 
-        # Print cleaning statistics
-        print(f"Total records after cleaning: {len(cleaned_df)}")
-        print(f"Records removed: {len(df) - len(cleaned_df)}")
-
-        # Final domain statistics
-        print("\n--- Final Dataset Statistics ---")
-        final_domain_counts = cleaned_df['domain'].value_counts()
-        for domain, count in final_domain_counts.items():
-            print(f"{domain}: {count} records")
+        # Print detailed summary
+        print("\nDomain and Concept Distribution:")
+        print("-" * 40)
         
-        # Detailed concept statistics per domain
-        print("\n--- Concept Distribution per Domain ---")
-        concept_distribution = defaultdict(lambda: defaultdict(int))
-        for _, row in cleaned_df.iterrows():
-            concept_distribution[row['domain']][row['concept']] += 1
-        
-        for domain, concepts in concept_distribution.items():
+        for domain, concepts in domain_summary.items():
             print(f"\n{domain} Domain:")
-            for concept, count in concepts.items():
-                print(f"  - {concept}: {count} records")
+            total_domain_records = sum(concept['count'] for concept in concepts)
+            print(f"  Total Domain Records: {total_domain_records}")
+            
+            # Sort concepts by count in descending order
+            sorted_concepts = sorted(concepts, key=lambda x: x['count'], reverse=True)
+            
+            for concept in sorted_concepts:
+                percentage = (concept['count'] / total_domain_records) * 100
+                print(f"  - {concept['concept']}: {concept['count']} records ({percentage:.2f}%)")
 
-        # Save cleaned CSV if output file specified
-        if output_file is None:
-            output_file = input_file.replace('.csv', '_cleaned.csv')
-        
-        cleaned_df.to_csv(output_file, index=False, encoding='utf-8')
-        print(f"\nCleaned CSV saved to: {output_file}")
-
-        return cleaned_df
+        return domain_summary
 
     except Exception as e:
         print(f"Error processing CSV: {str(e)}")
@@ -78,13 +57,11 @@ def clean_and_analyze_csv(input_file, output_file=None):
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python script.py <input_csv_path> [output_csv_path]")
+        print("Usage: python script.py <input_csv_path>")
         sys.exit(1)
     
     input_file = sys.argv[1]
-    output_file = sys.argv[2] if len(sys.argv) > 2 else None
-    
-    clean_and_analyze_csv(input_file, output_file)
+    analyze_domain_concepts(input_file)
 
 if __name__ == "__main__":
     main()
