@@ -1,0 +1,580 @@
+import pandas as pd
+import numpy as np
+from pathlib import Path
+import faiss
+import pickle
+from typing import List, Dict, Tuple, Set, Optional, Callable, Any, Iterator
+from dataclasses import dataclass
+from sentence_transformers import SentenceTransformer
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import random
+from tqdm import tqdm
+from test import *  # for chinou_response
+import json
+import logging
+import time
+from threading import Lock
+import os
+import math
+from queue import Queue
+from datetime import datetime, timedelta
+import re
+
+# Constants
+SAMPLES_PER_CLASS = 500
+BATCH_SIZE = 5
+EMBEDDING_BATCH_SIZE = 32
+MAX_RETRIES = 5
+MAX_WORKERS = 4
+CONTEXT_SIZE = 6
+MAX_CONCURRENT_REQUESTS = 5
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+class DomainConceptDefinitions:
+    """Manages domain and concept definitions."""
+    
+    def __init__(self, definition_file: str):
+        self.definitions = {}
+        self.load_definitions(definition_file)
+    
+    def load_definitions(self, file_path: str):
+        try:
+            with open(file_path, 'r') as f:
+                for line in f:
+                    if line.strip() and not line.startswith('#'):
+                        domain, concept, definition = line.strip().split('|')
+                        key = (domain.strip(), concept.strip())
+                        self.definitions[key] = definition.strip()
+        except Exception as e:
+            logger.error(f"Error loading definitions: {str(e)}")
+            raise
+    
+    def get_definition(self, domain: str, concept: str) -> str:
+        return self.definitions.get((domain, concept), "")
+
+class GlobalAttributeTracker:
+    """Tracks all generated attributes across threads."""
+    
+    def __init__(self):
+        self.lock = Lock()
+        self.used_attributes = {}  # {(domain, concept): set(attribute_names)}
+    
+    def is_attribute_used(self, domain: str, concept: str, attribute_name: str) -> bool:
+        with self.lock:
+            key = (domain, concept)
+            return attribute_name in self.used_attributes.get(key, set())
+    
+    def add_attribute(self, domain: str, concept: str, attribute_name: str):
+        with self.lock:
+            key = (domain, concept)
+            if key not in self.used_attributes:
+                self.used_attributes[key] = set()
+            self.used_attributes[key].add(attribute_name)
+    
+    def get_used_attributes(self, domain: str, concept: str) -> Set[str]:
+        with self.lock:
+            return self.used_attributes.get((domain, concept), set()).copy()
+
+class ConcurrentRateLimiter:
+    """Rate limiter that supports concurrent requests."""
+    
+    def __init__(self, max_concurrent: int = MAX_CONCURRENT_REQUESTS):
+        self.lock = Lock()
+        self.error_window = []
+        self.window_size = 10
+        self.current_delay = 0.2
+        self.min_delay = 0.1
+        self.max_delay = 5.0
+        self.request_times = Queue()
+        self.max_concurrent = max_concurrent
+        self.success_count = 0
+        self.error_count = 0
+
+    def update_delay(self, success: bool):
+        with self.lock:
+            self.error_window.append(not success)
+            if len(self.error_window) > self.window_size:
+                self.error_window.pop(0)
+            
+            if success:
+                self.success_count += 1
+                if self.success_count >= 5:
+                    self.current_delay = max(
+                        self.min_delay,
+                        self.current_delay * 0.9
+                    )
+                    self.success_count = 0
+            else:
+                self.error_count += 1
+                self.success_count = 0
+                self.current_delay = min(
+                    self.max_delay,
+                    self.current_delay * 1.5
+                )
+
+    def wait(self):
+        with self.lock:
+            current_time = time.time()
+            
+            while not self.request_times.empty():
+                old_time = self.request_times.get()
+                if current_time - old_time < self.current_delay:
+                    self.request_times.put(old_time)
+                    break
+            
+            while self.request_times.qsize() >= self.max_concurrent:
+                oldest_time = self.request_times.get()
+                wait_time = max(0, self.current_delay - (current_time - oldest_time))
+                if wait_time > 0:
+                    time.sleep(wait_time)
+                    current_time = time.time()
+            
+            self.request_times.put(current_time)
+
+class AdaptiveRetryHandler:
+    """Handles retries with adaptive backoff."""
+    
+    def __init__(self, max_retries: int = MAX_RETRIES):
+        self.max_retries = max_retries
+        self.rate_limiter = ConcurrentRateLimiter()
+
+    def execute_with_retry(self, func: Callable[..., Any], *args, **kwargs) -> Any:
+        last_exception = None
+        
+        for attempt in range(self.max_retries):
+            try:
+                self.rate_limiter.wait()
+                result = func(*args, **kwargs)
+                self.rate_limiter.update_delay(success=True)
+                return result
+                
+            except Exception as e:
+                last_exception = e
+                self.rate_limiter.update_delay(success=False)
+                logger.warning(
+                    f"Attempt {attempt + 1}/{self.max_retries} failed: {str(e)}. "
+                    f"Current delay: {self.rate_limiter.current_delay:.2f}s"
+                )
+                
+        raise last_exception
+
+class SampleGenerator:
+    """Handles synthetic sample generation with parallel processing."""
+    
+    def __init__(self, 
+                 batch_size: int = BATCH_SIZE,
+                 domain_defs: DomainConceptDefinitions = None):
+        self.batch_size = batch_size
+        self.used_samples_lock = Lock()
+        self.retry_handler = AdaptiveRetryHandler()
+        self.attribute_tracker = GlobalAttributeTracker()
+        self.domain_defs = domain_defs
+        self.generation_stats = {
+            'attempts': 0,
+            'successes': 0,
+            'failures': 0,
+            'duplicates_avoided': 0
+        }
+
+    def _determine_k(self, sample_size: int) -> int:
+        if sample_size <= 1:
+            return 1
+        elif sample_size <= 3:
+            return min(sample_size, 2)
+        elif sample_size <= 10:
+            return min(sample_size, 3)
+        else:
+            return min(sample_size, 6)
+
+    def get_shuffled_context(self, samples: List[Dict], k: int) -> List[Dict]:
+        available = samples.copy()
+        random.shuffle(available)
+        return available[:k]
+
+    def generate_prompt(self, 
+                       domain: str,
+                       concept: str,
+                       context_samples: List[Dict],
+                       batch_size: int) -> str:
+        context_str = "\n".join([
+            f"Example {i+1}:\nAttribute: {s['attribute_name']}\nDescription: {s['description']}"
+            for i, s in enumerate(context_samples)
+        ])
+        
+        # Get domain-concept definition
+        definition = self.domain_defs.get_definition(domain, concept) if self.domain_defs else ""
+        definition_str = f"\nDefinition of {domain}-{concept}: {definition}\n" if definition else ""
+        
+        used_attributes = self.attribute_tracker.get_used_attributes(domain, concept)
+        avoid_str = "\nAvoid these existing attribute names:\n" + ", ".join(used_attributes) if used_attributes else ""
+        
+        return f"""Based on these examples from {domain} - {concept}:{definition_str}{avoid_str}
+{context_str}
+
+Generate {batch_size} new, unique analytics attributes.
+Each must follow the pattern shown in examples but be distinctly different.
+
+Requirements:
+1. Attribute names must be in snake_case and MUST be different from all examples and existing attributes
+2. Descriptions should be clear and concise
+3. Must be different from examples and previously generated attributes
+4. Follow the exact pattern seen in examples
+5. Attribute names should be meaningful and reflect their purpose
+
+Provide exactly {batch_size} responses in this format, one per line:
+{{"attribute_name": "name", "description": "description"}}
+
+Output {batch_size} lines of JSON only, no additional text."""
+
+    def validate_batch_response(self,
+                              response: str,
+                              expected_count: int,
+                              domain: str,
+                              concept: str) -> List[Dict]:
+        valid_samples = []
+        lines = [line.strip() for line in response.split('\n') if line.strip()]
+        
+        for line in lines:
+            try:
+                sample = json.loads(line)
+                if not all(key in sample for key in ['attribute_name', 'description']):
+                    continue
+                
+                # Validate snake_case
+                if not re.match(r'^[a-z][a-z0-9_]*$', sample['attribute_name']):
+                    continue
+                
+                # Check for duplicates
+                if self.attribute_tracker.is_attribute_used(domain, concept, sample['attribute_name']):
+                    self.generation_stats['duplicates_avoided'] += 1
+                    continue
+                
+                self.attribute_tracker.add_attribute(domain, concept, sample['attribute_name'])
+                valid_samples.append(sample)
+                
+            except:
+                continue
+        
+        return valid_samples
+
+    def generate_batch(self,
+                      domain: str,
+                      concept: str,
+                      base_samples: List[Dict],
+                      k: int,
+                      used_samples: Set[str]) -> List[Dict]:
+        context = self.get_shuffled_context(base_samples, k)
+        prompt = self.generate_prompt(domain, concept, context, self.batch_size)
+        
+        def _make_llm_call():
+            self.generation_stats['attempts'] += 1
+            return chinou_response(prompt)
+        
+        try:
+            response = self.retry_handler.execute_with_retry(_make_llm_call)
+            samples = self.validate_batch_response(response, self.batch_size, domain, concept)
+            
+            if not samples:
+                self.generation_stats['failures'] += 1
+                return []
+            
+            valid_samples = []
+            with self.used_samples_lock:
+                for sample in samples:
+                    sample['domain'] = domain
+                    sample['concept'] = concept
+                    sample_key = f"{sample['attribute_name']}_{sample['description']}"
+                    
+                    if sample_key not in used_samples:
+                        used_samples.add(sample_key)
+                        valid_samples.append(sample)
+            
+            if valid_samples:
+                self.generation_stats['successes'] += 1
+                
+            return valid_samples
+                
+        except Exception as e:
+            self.generation_stats['failures'] += 1
+            logger.error(f"Batch generation failed after all retries: {str(e)}")
+            return []
+
+    def generate_samples_parallel(self,
+                                domain: str,
+                                concept: str,
+                                base_samples: List[Dict],
+                                num_needed: int,
+                                used_samples: Set[str]) -> List[Dict]:
+        """Generate samples using parallel processing."""
+        synthetic_samples = []
+        k = self._determine_k(len(base_samples))
+        
+        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS) as executor:
+            futures = []
+            
+            while len(synthetic_samples) < num_needed:
+                # Calculate remaining samples needed
+                remaining = num_needed - len(synthetic_samples)
+                num_batches = math.ceil(remaining / self.batch_size)
+                
+                # Submit new batch requests
+                for _ in range(num_batches):
+                    future = executor.submit(
+                        self.generate_batch,
+                        domain,
+                        concept,
+                        base_samples,
+                        k,
+                        used_samples
+                    )
+                    futures.append(future)
+                
+                # Process completed futures
+                for future in tqdm(as_completed(futures),
+                                 total=len(futures),
+                                 desc=f"Generating samples for {domain}-{concept}"):
+                    batch = future.result()
+                    if batch:
+                        synthetic_samples.extend(batch)
+                    
+                    if len(synthetic_samples) >= num_needed:
+                        # Cancel remaining futures
+                        for f in futures:
+                            if not f.done():
+                                f.cancel()
+                        break
+                
+                # Clear completed futures
+                futures = [f for f in futures if not f.done()]
+            
+            return synthetic_samples[:num_needed]
+
+    def generate_samples(self,
+                        domain: str,
+                        concept: str,
+                        base_samples: List[Dict],
+                        num_needed: int,
+                        used_samples: Set[str]) -> List[Dict]:
+        return self.generate_samples_parallel(
+            domain,
+            concept,
+            base_samples,
+            num_needed,
+            used_samples
+        )
+
+    def log_generation_stats(self):
+        stats = self.generation_stats
+        success_rate = (stats['successes'] / stats['attempts']) if stats['attempts'] > 0 else 0
+        
+        logger.info("\nGeneration Statistics:")
+        logger.info(f"Total attempts: {stats['attempts']}")
+        logger.info(f"Successful generations: {stats['successes']}")
+        logger.info(f"Failed generations: {stats['failures']}")
+        logger.info(f"Duplicates avoided: {stats['duplicates_avoided']}")
+        logger.info(f"Success rate: {success_rate:.2%}")
+        logger.info(f"Current delay: {self.retry_handler.rate_limiter.current_delay:.2f}s")
+
+class DataBalancer:
+    """Main class for data balancing operations."""
+    
+    def __init__(self,
+                 max_workers: int = MAX_WORKERS,
+                 batch_size: int = BATCH_SIZE,
+                 domain_defs_path: str = None):
+        self.max_workers = max_workers
+        self.domain_defs = DomainConceptDefinitions(domain_defs_path) if domain_defs_path else None
+        self.sample_generator = SampleGenerator(batch_size, self.domain_defs)
+        self.embedding_manager = ParallelEmbeddingManager(max_workers=max_workers)
+   def balance_dataset(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """Balance dataset with parallel processing."""
+        logger.info("Starting dataset balancing...")
+        
+        training_samples = []
+        eval_samples = []
+        used_samples = set()
+        
+        for (domain, concept), group in df.groupby(['domain', 'concept']):
+            samples = group.to_dict('records')
+            logger.info(f"\nProcessing {domain}-{concept}: {len(samples)} samples")
+            
+            if len(samples) > SAMPLES_PER_CLASS:
+                random.shuffle(samples)
+                training_samples.extend(samples[:SAMPLES_PER_CLASS])
+                eval_samples.extend(samples[SAMPLES_PER_CLASS:])
+                logger.info(f"Split into {SAMPLES_PER_CLASS} training and {len(samples)-SAMPLES_PER_CLASS} evaluation samples")
+            else:
+                training_samples.extend(samples)
+                num_needed = SAMPLES_PER_CLASS - len(samples)
+                
+                if num_needed > 0:
+                    logger.info(f"Generating {num_needed} synthetic samples...")
+                    synthetic = self.sample_generator.generate_samples(
+                        domain,
+                        concept,
+                        samples,
+                        num_needed,
+                        used_samples
+                    )
+                    training_samples.extend(synthetic)
+                    logger.info(f"Generated {len(synthetic)} synthetic samples")
+            
+            # Track used samples
+            for sample in samples:
+                used_samples.add(f"{sample['attribute_name']}_{sample['description']}")
+        
+        # Create final dataframes
+        training_df = pd.DataFrame(training_samples)
+        eval_df = pd.DataFrame(eval_samples)
+        
+        # Log generation statistics
+        self.sample_generator.log_generation_stats()
+        
+        return training_df, eval_df
+
+def main(input_path: str,
+         output_dir: str = 'data',
+         max_workers: int = MAX_WORKERS,
+         batch_size: int = BATCH_SIZE,
+         domain_defs_path: str = None):
+    """Main execution function."""
+    try:
+        # Setup directories
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        
+        # Set up logging file
+        log_path = output_path / 'balancer.log'
+        file_handler = logging.FileHandler(log_path)
+        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        logger.addHandler(file_handler)
+        
+        # Read input data
+        logger.info(f"Reading data from {input_path}")
+        df = pd.read_csv(input_path)
+        
+        # Validate input data
+        required_columns = {'attribute_name', 'description', 'domain', 'concept'}
+        if not required_columns.issubset(df.columns):
+            raise ValueError(f"Input CSV must contain columns: {required_columns}")
+        
+        # Log initial statistics
+        logger.info("\nInitial Data Statistics:")
+        logger.info(f"Total records: {len(df)}")
+        logger.info(f"Unique domains: {df['domain'].nunique()}")
+        logger.info(f"Unique concepts: {df['concept'].nunique()}")
+        logger.info("\nDomain-Concept Distribution:")
+        logger.info(df.groupby(['domain', 'concept']).size())
+        
+        # Initialize balancer
+        balancer = DataBalancer(max_workers, batch_size, domain_defs_path)
+        
+        # Process data
+        start_time = time.time()
+        training_df, eval_df = balancer.balance_dataset(df)
+        processing_time = time.time() - start_time
+        
+        # Save results
+        training_path = output_path / 'balanced_training_data.csv'
+        eval_path = output_path / 'evaluation_data.csv'
+        original_path = output_path / 'original_data.csv'
+        
+        df.to_csv(original_path, index=False)
+        training_df.to_csv(training_path, index=False)
+        eval_df.to_csv(eval_path, index=False)
+        
+        # Generate detailed report
+        report = [
+            "Data Balance Report",
+            "=" * 50,
+            f"\nProcessing Configuration:",
+            f"Max Workers: {max_workers}",
+            f"Batch Size: {batch_size}",
+            f"Max Concurrent Requests: {MAX_CONCURRENT_REQUESTS}",
+            f"Domain Definitions: {'Used' if domain_defs_path else 'Not Used'}",
+            f"Processing Time: {processing_time:.2f} seconds",
+            f"\nOriginal Data Statistics:",
+            f"Total Records: {len(df)}",
+            f"Domains: {df['domain'].nunique()}",
+            f"Concepts: {df['concept'].nunique()}",
+            "\nOriginal Distribution:",
+            str(df.groupby(['domain', 'concept']).size()),
+            "\nBalanced Training Set Distribution:",
+            str(training_df.groupby(['domain', 'concept']).size()),
+            "\nEvaluation Set Distribution:",
+            str(eval_df.groupby(['domain', 'concept']).size()),
+            f"\nProcessing Performance:",
+            f"Average time per sample: {processing_time/len(training_df):.3f} seconds",
+            f"Samples per second: {len(training_df)/processing_time:.2f}",
+            f"\nSynthetic Sample Statistics:",
+            f"Original samples: {len(df)}",
+            f"Training samples: {len(training_df)}",
+            f"Evaluation samples: {len(eval_df)}",
+            f"Generated samples: {len(training_df) - (len(df) - len(eval_df))}",
+            f"Duplicates avoided: {balancer.sample_generator.generation_stats['duplicates_avoided']}",
+            f"\nRate Limiting Statistics:",
+            f"Average delay between requests: {balancer.sample_generator.retry_handler.rate_limiter.current_delay:.2f}s",
+            f"Max concurrent requests: {MAX_CONCURRENT_REQUESTS}",
+            f"Final error rate: {sum(balancer.sample_generator.retry_handler.rate_limiter.error_window)/len(balancer.sample_generator.retry_handler.rate_limiter.error_window) if balancer.sample_generator.retry_handler.rate_limiter.error_window else 0:.2%}"
+        ]
+        
+        # Save report
+        report_path = output_path / 'balance_report.txt'
+        with open(report_path, 'w') as f:
+            f.write('\n'.join(report))
+        
+        logger.info(f"\nProcessing complete!")
+        logger.info(f"Files saved:")
+        logger.info(f"1. Original data: {original_path}")
+        logger.info(f"2. Training data: {training_path}")
+        logger.info(f"3. Evaluation data: {eval_path}")
+        logger.info(f"4. Balance report: {report_path}")
+        logger.info(f"5. Process log: {log_path}")
+        
+        return str(training_path), str(eval_path)
+        
+    except Exception as e:
+        logger.error(f"Error in main execution: {str(e)}")
+        raise
+
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Balance dataset with adaptive rate limiting')
+    parser.add_argument('--input', 
+                       required=True,
+                       help='Input CSV file path')
+    parser.add_argument('--output-dir',
+                       default='data',
+                       help='Output directory')
+    parser.add_argument('--max-workers',
+                       type=int,
+                       default=MAX_WORKERS,
+                       help='Maximum number of parallel workers')
+    parser.add_argument('--batch-size',
+                       type=int,
+                       default=BATCH_SIZE,
+                       help='Batch size for generation')
+    parser.add_argument('--domain-defs',
+                       help='Path to domain-concept definitions file')
+    
+    args = parser.parse_args()
+    
+    try:
+        main(
+            args.input,
+            args.output_dir,
+            args.max_workers,
+            args.batch_size,
+            args.domain_defs
+        )
+        logger.info("Processing completed successfully!")
+    except Exception as e:
+        logger.error(f"Failed to process dataset: {str(e)}")
+        raise 
