@@ -47,3 +47,17 @@ transactions_balances|income_expense_position|Non-trade positions covering fees,
 transactions_balances|trading_position|Quantity held in specific assets, aggregated by various dimensions like book or settlement date
 transactions_balances|pretrade|Initial phase of trading activity including inquiries, quotes and order placement
 transactions_balances|trade|Lifecycle of financial contracts between parties from agreement on terms through obligation fulfillment
+
+
+
+# Organizational Concepts
+organization|function|Framework of authority where entities operate to achieve specific goals and meet business needs
+organization|research|Specialized analysis covering markets, economics, and investment strategies across multiple formats
+organization|sales|Customer service framework managing product offerings, campaign execution, and client relationship activities
+
+# Operational Data Concepts
+operational|account|Container for business records tracking regular dealings and services between provider and account owner
+operational|analytical_snapshot|Compilation of inputs and processes for financial models to assess value and risk at specific times
+operational|book|Hierarchical container organizing financial assets and liabilities for specific business purposes and reporting
+operational|business_control|Processes regulating organizational operations and managing operational risks excluding strategic decisions
+operational|legal_agreement|Standardized document specifying party obligations in financial transactions based on industry templates
