@@ -10,3 +10,10 @@ analytics|credit_risk|Analysis of counterparty default exposure in financial tra
 analytics|market_risk|Analysis of exposure to market factor changes affecting financial assets and liabilities values
 analytics|risk_metrics|Point-in-time quantification of financial holdings' sensitivity to market factor changes using mathematical models
 analytics|valuation|Present value calculation of financial holdings using mathematical models against current market data
+# Format: domain|concept|definition
+reference_data|calendar|Calendar specifies business activity exclusion dates published by countries and market venues
+reference_data|geography|Hierarchical organization of geopolitical terms covering Countries, Regions and Municipalities
+reference_data|index|Performance measurement tool for market-specific security baskets
+reference_data|instrument|Financial asset characteristics and obligations defining tradable commitments from issuers and guarantors
+reference_data|rating|Credit risk evaluation and default likelihood assessment by rating agencies for debtors, including timeline-specific market risk indicators
+market_data|market_data|Observable point-in-time market information (prices, volumes, volatilities) and their derived complex objects like yield curves, available through market organizations and platforms
