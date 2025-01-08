@@ -1,0 +1,5 @@
+# Format: domain|concept|definition
+user|engagement|Metrics that measure how users interact with and stay involved with the product over time
+user|satisfaction|Indicators that reflect how well the product meets user needs and expectations
+product|performance|Metrics that track how well the product functions in terms of speed, reliability, and efficiency
+product|usage|Measurements of how frequently and extensively different product features are utilized
