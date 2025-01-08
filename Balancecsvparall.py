@@ -400,10 +400,6 @@ class DataBalancer:
                     logger.info(f"Generated {len(synthetic)} synthetic samples")
 
 
-
-
-
-
 for sample in samples:
                 used_samples.add(f"{sample['attribute_name']}_{sample['description']}")
         
@@ -549,3 +545,4 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"Failed to process dataset: {str(e)}")
         raise
+
