@@ -17,3 +17,21 @@ reference_data|index|Performance measurement tool for market-specific security b
 reference_data|instrument|Financial asset characteristics and obligations defining tradable commitments from issuers and guarantors
 reference_data|rating|Credit risk evaluation and default likelihood assessment by rating agencies for debtors, including timeline-specific market risk indicators
 market_data|market_data|Observable point-in-time market information (prices, volumes, volatilities) and their derived complex objects like yield curves, available through market organizations and platforms
+
+
+
+
+
+
+
+
+
+# Format: domain|concept|definition
+reference_data|calendar|Set of dates marking when regular business activities are suspended, as defined by market venues and countries
+reference_data|geography|Collection of geopolitical classifications including countries, regions, and administrative divisions
+reference_data|index|Performance measurement tool for tracking specific market segments through security baskets
+reference_data|instrument|Financial asset definition specifying characteristics and obligations that can be traded
+reference_data|rating|Credit risk evaluation of entities or instruments by rating agencies predicting debt repayment capability
+reference_data|entity|Organization formed under commercial law for business or other allowed activities with defined ownership structure
+reference_data|person|Individual human being engaged in financial market activities
+reference_data|business_classification|Economic categorization system used to standardize market participants and instruments
