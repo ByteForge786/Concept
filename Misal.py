@@ -1,3 +1,32 @@
+def setup_folders(base_path: str, classifier_type: str) -> str:
+    """Create necessary folders for experiment."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    experiment_path = Path(base_path) / classifier_type / timestamp
+    experiment_path.mkdir(parents=True, exist_ok=True)
+    return str(experiment_path)
+
+def train_pipeline(config: Config, 
+                  train_data: pd.DataFrame,
+                  base_path: str = 'experiments') -> str:
+    """Complete training pipeline."""
+    experiment_path = None  # Initialize it here
+    try:
+        # Setup experiment folder
+        experiment_path = setup_folders(base_path, config.classification_head)
+        logger.info(f"Starting experiment in {experiment_path}")
+        
+        # Rest of your code...
+        
+    except Exception as e:
+        logger.error(f"Error in training pipeline: {e}", exc_info=True)
+        # Cleanup incomplete experiment
+        if experiment_path:  # Now this check is valid
+            shutil.rmtree(experiment_path, ignore_errors=True)
+        raise
+
+
+
+
 def create_pairs(self, df: pd.DataFrame) -> List[InputExample]:
     """Create training pairs focusing on similarity-based negative pairs."""
     main_dict = {}
