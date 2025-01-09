@@ -1,3 +1,124 @@
+import concurrent.futures
+from typing import List, Tuple
+import pandas as pd
+import time
+import logging
+from tqdm import tqdm
+
+class DescriptionProcessor:
+    def __init__(self, config):
+        self.config = config
+        self.logger = logging.getLogger(__name__)
+
+    def standardize_single_description(self, attr_name: str, desc: str) -> str:
+        """Standardize a single description using LLM."""
+        prompt = f"""Please standardize this attribute description into a clear, concise format.
+        
+        Attribute: {attr_name}
+        Description: {desc}
+        
+        Return in following format only:
+        Standardized Description: [your standardized description here]
+        """
+        
+        try:
+            # Simple retry logic
+            for attempt in range(3):
+                try:
+                    rate_limiter.wait()
+                    response = chinou_response(prompt)
+                    rate_limiter.success()
+                    
+                    # Just take the description after the prefix
+                    if "Standardized Description:" in response:
+                        return response.split("Standardized Description:")[1].strip()
+                    else:
+                        return response
+                        
+                except Exception as e:
+                    rate_limiter.failure()
+                    if attempt < 2:  # Don't wait on last attempt
+                        time.sleep((2 ** attempt) * 1)  # 1, 2, 4 seconds
+                    if attempt == 2:
+                        self.logger.error(f"Failed to standardize after 3 attempts: {e}")
+                        return desc
+                    
+        except Exception as e:
+            self.logger.error(f"Error standardizing description: {e}")
+            return desc
+
+    def standardize_description_batch(self, batch: List[Tuple[str, str]], max_workers: int = None) -> List[str]:
+        """Parallelized batch description standardization using threads."""
+        # Use ThreadPoolExecutor for I/O-bound tasks like API calls
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Create futures for each description in the batch
+            futures = [
+                executor.submit(self.standardize_single_description, attr_name, desc)
+                for attr_name, desc in batch
+            ]
+            
+            # Collect results as they complete
+            standardized = []
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    standardized.append(future.result())
+                except Exception as e:
+                    self.logger.error(f"Exception in thread: {e}")
+                    standardized.append(desc)  # Fallback to original description
+        
+        return standardized
+
+    def process_descriptions(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Process all descriptions with parallelization."""
+        if not self.config.description_refine:
+            return df
+        
+        self.logger.info("Starting description standardization...")
+        
+        # Create batches
+        batch_size = 5  # Small batch size for API calls
+        batches = [
+            list(zip(df['attribute_name'][i:i+batch_size], 
+                    df['description'][i:i+batch_size]))
+            for i in range(0, len(df), batch_size)
+        ]
+        
+        # Process batches with progress bar and threading
+        standardized_descriptions = []
+        with tqdm(total=len(batches), desc="Standardizing descriptions") as pbar:
+            # Limit concurrent threads to prevent overwhelming the API
+            max_workers = min(10, len(batches))  # Adjust based on your API's rate limits
+            
+            # Use ThreadPoolExecutor for batch processing
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # Submit batches to executor
+                future_to_batch = {
+                    executor.submit(self.standardize_description_batch, batch): batch 
+                    for batch in batches
+                }
+                
+                # Process completed batches
+                for future in concurrent.futures.as_completed(future_to_batch):
+                    try:
+                        batch_results = future.result()
+                        standardized_descriptions.extend(batch_results)
+                        pbar.update(1)
+                    except Exception as e:
+                        self.logger.error(f"Batch processing error: {e}")
+        
+        df['processed_description'] = standardized_descriptions
+        
+        # Log some examples
+        self.logger.info("Standardization examples:")
+        for i in range(min(3, len(df))):
+            self.logger.info(f"\nAttribute: {df['attribute_name'].iloc[i]}")
+            self.logger.info(f"Original: {df['description'].iloc[i]}")
+            self.logger.info(f"Standardized: {df['processed_description'].iloc[i]}")
+        
+        return df
+
+
+
 def process_descriptions(self, df: pd.DataFrame) -> pd.DataFrame:
     # ... existing code ...
     
