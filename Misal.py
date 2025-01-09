@@ -1,3 +1,89 @@
+def create_pairs(self, df: pd.DataFrame) -> List[InputExample]:
+    """Create training pairs for contrastive learning with enhanced negative pair strategy."""
+    main_dict = {}
+    for _, row in df.iterrows():
+        domain = row['domain']
+        concept = row['concept']
+        text = row['processed_description'] if 'processed_description' in df.columns else row['description']
+        
+        if domain not in main_dict:
+            main_dict[domain] = {}
+        if concept not in main_dict[domain]:
+            main_dict[domain][concept] = []
+        main_dict[domain][concept].append(text)
+
+    positive_pairs = []
+    same_domain_negatives = []
+    other_domain_negatives = []
+    
+    # Create positive pairs (same concept)
+    for domain in main_dict:
+        for concept in main_dict[domain]:
+            texts = main_dict[domain][concept]
+            for text1, text2 in combinations(texts, 2):
+                positive_pairs.append(InputExample(texts=[text1, text2], label=1.0))
+
+    # Calculate concept name similarities using sentence transformer
+    model = SentenceTransformer('sentence-transformers/all-mpnet-base-v2')
+    all_concepts = list(set(concept for domain in main_dict for concept in main_dict[domain]))
+    concept_embeddings = model.encode(all_concepts)
+    concept_embeddings = concept_embeddings / np.linalg.norm(concept_embeddings, axis=1)[:, np.newaxis]
+    
+    concept_similarities = {}
+    for i, j in combinations(range(len(all_concepts)), 2):
+        sim = float(np.dot(concept_embeddings[i], concept_embeddings[j]))
+        concept_similarities[(all_concepts[i], all_concepts[j])] = sim
+        concept_similarities[(all_concepts[j], all_concepts[i])] = sim
+    
+    # Create negative pairs with weights based on concept similarity
+    all_texts = [(text, domain, concept) 
+                for domain in main_dict 
+                for concept in main_dict[domain] 
+                for text in main_dict[domain][concept]]
+    
+    for (text1, domain1, concept1), (text2, domain2, concept2) in combinations(all_texts, 2):
+        if concept1 != concept2:  # Different concepts
+            similarity = concept_similarities.get((concept1, concept2), 0.0)
+            weight = 1.0 + similarity  # Higher weight for similar concepts
+            
+            if domain1 == domain2:  # Same domain
+                same_domain_negatives.append(
+                    InputExample(texts=[text1, text2], label=0.0))
+            else:  # Different domain
+                other_domain_negatives.append(
+                    InputExample(texts=[text1, text2], label=0.0))
+
+    # Balance negative pairs
+    total_positives = len(positive_pairs)
+    num_same_domain = int(total_positives * 0.7)  # 70% same domain negatives
+    num_other_domain = int(total_positives * 0.3)  # 30% other domain negatives
+    
+    # Ensure we don't sample more than available
+    num_same_domain = min(num_same_domain, len(same_domain_negatives))
+    num_other_domain = min(num_other_domain, len(other_domain_negatives))
+    
+    # Sample negative pairs
+    sampled_same_domain = random.sample(same_domain_negatives, num_same_domain)
+    sampled_other_domain = random.sample(other_domain_negatives, num_other_domain)
+    
+    # Combine all pairs
+    all_pairs = positive_pairs + sampled_same_domain + sampled_other_domain
+    random.shuffle(all_pairs)
+    
+    logger.info(f"Created {len(positive_pairs)} positive pairs")
+    logger.info(f"Created {num_same_domain} same-domain negative pairs")
+    logger.info(f"Created {num_other_domain} other-domain negative pairs")
+    logger.info(f"Total pairs: {len(all_pairs)}")
+    
+    return all_pairs
+
+
+
+
+
+
+
+
 class SampleGenerator:
     """Handles synthetic sample generation with parallel processing."""
     
