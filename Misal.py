@@ -1,3 +1,17 @@
+def process_descriptions(self, df: pd.DataFrame) -> pd.DataFrame:
+    # ... existing code ...
+    
+    df['processed_description'] = standardized_descriptions
+    
+    # Save to CSV
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = f"standardized_descriptions_{timestamp}.csv"
+    df.to_csv(output_path, index=False)
+    logger.info(f"Saved standardized descriptions to: {output_path}")
+    
+    return df
+
+
 def standardize_description_batch(self, batch: List[Tuple[str, str]]) -> List[str]:
     """Standardize a batch of descriptions using LLM."""
     standardized = []
