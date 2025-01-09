@@ -1,3 +1,85 @@
+def standardize_description_batch(self, batch: List[Tuple[str, str]]) -> List[str]:
+    """Standardize a batch of descriptions using LLM."""
+    standardized = []
+    
+    for attr_name, desc in batch:
+        prompt = f"""Please standardize this attribute description into a clear, concise format.
+        
+        Attribute: {attr_name}
+        Description: {desc}
+        
+        Return in following format only:
+        Standardized Description: [your standardized description here]
+        """
+        
+        try:
+            # Simple retry logic
+            for attempt in range(3):
+                try:
+                    rate_limiter.wait()
+                    response = chinou_response(prompt)
+                    rate_limiter.success()
+                    
+                    # Just take the description after the prefix
+                    if "Standardized Description:" in response:
+                        std_desc = response.split("Standardized Description:")[1].strip()
+                        standardized.append(std_desc)
+                        break
+                    else:
+                        standardized.append(response)
+                        break
+                        
+                except Exception as e:
+                    rate_limiter.failure()
+                    if attempt < 2:  # Don't wait on last attempt
+                        time.sleep((2 ** attempt) * 1)  # 1, 2, 4 seconds
+                    if attempt == 2:
+                        standardized.append(desc)  # Use original on final failure
+                        logger.error(f"Failed to standardize after 3 attempts: {e}")
+                    
+        except Exception as e:
+            logger.error(f"Error standardizing description: {e}")
+            standardized.append(desc)  # Fallback to original
+    
+    return standardized
+
+def process_descriptions(self, df: pd.DataFrame) -> pd.DataFrame:
+    """Process all descriptions."""
+    if not self.config.description_refine:
+        return df
+        
+    logger.info("Starting description standardization...")
+    
+    # Create batches
+    batch_size = 5  # Small batch size for API calls
+    batches = [
+        list(zip(df['attribute_name'][i:i+batch_size], 
+                df['description'][i:i+batch_size]))
+        for i in range(0, len(df), batch_size)
+    ]
+    
+    # Process batches with progress bar
+    standardized_descriptions = []
+    with tqdm(total=len(batches), desc="Standardizing descriptions") as pbar:
+        for batch in batches:
+            batch_results = self.standardize_description_batch(batch)
+            standardized_descriptions.extend(batch_results)
+            pbar.update(1)
+    
+    df['processed_description'] = standardized_descriptions
+    
+    # Log some examples
+    logger.info("Standardization examples:")
+    for i in range(min(3, len(df))):
+        logger.info(f"\nAttribute: {df['attribute_name'].iloc[i]}")
+        logger.info(f"Original: {df['description'].iloc[i]}")
+        logger.info(f"Standardized: {df['processed_description'].iloc[i]}")
+    
+    return df
+
+
+
+
 def setup_folders(base_path: str, classifier_type: str) -> str:
     """Create necessary folders for experiment."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
